@@ -47,20 +47,36 @@ export interface TrackingState {
 }
 
 export type MessageType =
+	| "REGISTER_PAGE_CONTEXT"
 	| "UPDATE_VISIT_METRICS"
 	| "IMPORT_PROGRESS"
+	| "START_HISTORY_IMPORT"
 	| "GET_SETTINGS"
 	| "UPDATE_SETTINGS";
 
+export interface RegisterPageContextMessage {
+	type: "REGISTER_PAGE_CONTEXT";
+	pageKey: string;
+	url: string;
+}
+
 export interface VisitMetricsMessage {
 	type: "UPDATE_VISIT_METRICS";
+	pageKey: string;
+	url: string;
 	scrollDepth: number;
 	textContent?: string;
 }
 
 export interface ImportProgressMessage {
 	type: "IMPORT_PROGRESS";
+	importing: boolean;
 	current: number;
 	total: number;
 	done: boolean;
+	error?: string;
+}
+
+export interface StartHistoryImportMessage {
+	type: "START_HISTORY_IMPORT";
 }

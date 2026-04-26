@@ -8,6 +8,8 @@ export const SEARCH_DEBOUNCE_MS = 300;
 
 export const SEARCH_SNIPPET_LENGTH = 150;
 
+export const IMPORT_STATE_STORAGE_KEY = "historyImportState";
+
 export const DEFAULT_SETTINGS = {
 	sessionGapMinutes: 30,
 	importCompleted: false,

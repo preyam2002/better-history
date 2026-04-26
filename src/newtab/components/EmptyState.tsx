@@ -71,7 +71,8 @@ export const EmptyState = () => {
 			</h2>
 			<p className="text-[13px] text-sand-500 max-w-xs mx-auto leading-relaxed">
 				Your browsing history will appear here as you browse. Pages are
-				automatically tracked with full-text content for powerful search.
+				automatically indexed on-device with full-text content for powerful
+				search.
 			</p>
 		</div>
 	);

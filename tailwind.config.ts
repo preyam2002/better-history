@@ -6,8 +6,20 @@ export default {
 	theme: {
 		extend: {
 			fontFamily: {
-				serif: ['"Instrument Serif"', "Georgia", "serif"],
-				sans: ['"Plus Jakarta Sans"', "system-ui", "sans-serif"],
+				serif: [
+					"Iowan Old Style",
+					"Palatino Linotype",
+					"Book Antiqua",
+					"Georgia",
+					"serif",
+				],
+				sans: [
+					"Avenir Next",
+					"Segoe UI",
+					"Helvetica Neue",
+					"system-ui",
+					"sans-serif",
+				],
 			},
 			colors: {
 				sand: {

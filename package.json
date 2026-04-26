@@ -1,10 +1,11 @@
 {
   "name": "better-history",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "package:extension": "npm run build && node ./scripts/package-extension.mjs",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "test": "vitest run",

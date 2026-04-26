@@ -3,7 +3,7 @@ import { defineManifest } from "@crxjs/vite-plugin";
 export default defineManifest({
   manifest_version: 3,
   name: "Better History",
-  version: "0.1.0",
+  version: "0.1.1",
   description:
     "Better search, session grouping, and analytics for your browsing history.",
   permissions: ["history", "tabs", "idle", "storage", "alarms"],

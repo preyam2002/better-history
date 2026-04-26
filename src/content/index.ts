@@ -1,5 +1,25 @@
 import { extractPageContent } from "./extractor";
 
+const pageKey =
+	crypto.randomUUID?.() ??
+	`${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+const sendMessage = (
+	payload:
+		| {
+				type: "REGISTER_PAGE_CONTEXT";
+				pageKey: string;
+				url: string;
+		  }
+		| {
+				type: "UPDATE_VISIT_METRICS";
+				pageKey: string;
+				url: string;
+				scrollDepth: number;
+				textContent?: string;
+		  },
+) => chrome.runtime.sendMessage(payload).catch(() => {});
+
 let maxScrollDepth = 0;
 let contentExtracted = false;
 
@@ -18,10 +38,14 @@ const updateScrollDepth = () => {
 const reportMetrics = () => {
 	const payload: {
 		type: "UPDATE_VISIT_METRICS";
+		pageKey: string;
+		url: string;
 		scrollDepth: number;
 		textContent?: string;
 	} = {
 		type: "UPDATE_VISIT_METRICS",
+		pageKey,
+		url: window.location.href,
 		scrollDepth: maxScrollDepth,
 	};
 
@@ -37,8 +61,14 @@ const reportMetrics = () => {
 		}
 	}
 
-	chrome.runtime.sendMessage(payload).catch(() => {});
+	sendMessage(payload);
 };
+
+sendMessage({
+	type: "REGISTER_PAGE_CONTEXT",
+	pageKey,
+	url: window.location.href,
+});
 
 window.addEventListener("scroll", updateScrollDepth, { passive: true });
 

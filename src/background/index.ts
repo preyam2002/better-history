@@ -1,13 +1,21 @@
 import {
 	DEFAULT_SETTINGS,
 	EXCLUDED_URL_PREFIXES,
+	IMPORT_STATE_STORAGE_KEY,
 	MAX_IMPORT_DAYS,
 	SESSION_GAP_MS,
 } from "../shared/constants";
 import { db } from "../shared/db";
-import type { TrackingState, VisitMetricsMessage } from "../shared/types";
+import type {
+	ImportProgressMessage,
+	RegisterPageContextMessage,
+	StartHistoryImportMessage,
+	TrackingState,
+	VisitMetricsMessage,
+} from "../shared/types";
 import { extractDomain } from "../shared/utils";
 import { isValidUrl, sanitizeText } from "./helpers";
+import { createVisitContextRegistry } from "./visitContext";
 
 let state: TrackingState = {
 	activeTabId: null,
@@ -15,6 +23,9 @@ let state: TrackingState = {
 	pendingVisitId: null,
 	currentSessionId: null,
 };
+
+const visitContextRegistry = createVisitContextRegistry();
+let importJob: Promise<void> | null = null;
 
 // Serialize async state mutations to prevent race conditions
 // from concurrent tab events (activate, update, remove can fire in rapid succession)
@@ -46,6 +57,21 @@ const restoreState = async () => {
 	if (stored.trackingState) {
 		state = stored.trackingState as TrackingState;
 	}
+};
+
+const broadcastImportProgress = async (
+	progress: Omit<ImportProgressMessage, "type">,
+) => {
+	const payload: ImportProgressMessage = {
+		type: "IMPORT_PROGRESS",
+		...progress,
+	};
+
+	await chrome.storage.session.set({
+		[IMPORT_STATE_STORAGE_KEY]: payload,
+	});
+
+	chrome.runtime.sendMessage(payload).catch(() => {});
 };
 
 const isExcludedUrl = async (url: string): Promise<boolean> => {
@@ -125,6 +151,10 @@ const recordVisit = async (tab: chrome.tabs.Tab) => {
 	state.pendingVisitId = id as number;
 	await saveState();
 
+	if (tab.id !== undefined) {
+		visitContextRegistry.trackVisit(tab.id, tab.url, id as number, now);
+	}
+
 	await updateSessionTopDomain(sessionId);
 };
 
@@ -173,6 +203,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // Tab removed — finalize duration
 chrome.tabs.onRemoved.addListener((tabId) => {
 	withLock(async () => {
+		visitContextRegistry.clearTab(tabId);
+
 		if (tabId === state.activeTabId) {
 			await finalizeCurrentVisit();
 			state.activeTabId = null;
@@ -181,6 +213,172 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 		}
 	});
 });
+
+const runHistoryImport = async () => {
+	if (importJob) return importJob;
+
+	importJob = (async () => {
+		const result = await chrome.storage.sync.get("settings");
+		const settings = result.settings ?? { ...DEFAULT_SETTINGS };
+		const existingVisits = await db.visits.count();
+
+		if (settings.importCompleted || existingVisits > 0) {
+			await broadcastImportProgress({
+				importing: false,
+				current: existingVisits,
+				total: existingVisits,
+				done: settings.importCompleted,
+			});
+			return;
+		}
+
+		await broadcastImportProgress({
+			importing: true,
+			current: 0,
+			total: 0,
+			done: false,
+		});
+
+		try {
+			const startTime = Date.now() - MAX_IMPORT_DAYS * 24 * 60 * 60 * 1000;
+			const items = await chrome.history.search({
+				text: "",
+				startTime,
+				maxResults: 100000,
+			});
+
+			const filtered = [];
+			for (const item of items) {
+				if (item.url && !(await isExcludedUrl(item.url))) {
+					filtered.push(item);
+				}
+			}
+			const sorted = filtered.sort(
+				(a, b) => (a.lastVisitTime ?? 0) - (b.lastVisitTime ?? 0),
+			);
+
+			const total = sorted.length;
+			let sessionId: number | null = null;
+			let lastTimestamp = 0;
+			const gapMs = SESSION_GAP_MS;
+
+			await broadcastImportProgress({
+				importing: true,
+				current: 0,
+				total,
+				done: false,
+			});
+
+			// Track session metadata locally to avoid N+1 DB queries per batch
+			const sessionMeta = new Map<
+				number,
+				{
+					visitCount: number;
+					endTime: number;
+					domainCounts: Map<string, number>;
+				}
+			>();
+
+			const BATCH_SIZE = 500;
+			for (let i = 0; i < sorted.length; i += BATCH_SIZE) {
+				const batch = sorted.slice(i, i + BATCH_SIZE);
+				const visits = [];
+
+				for (const item of batch) {
+					const timestamp = item.lastVisitTime ?? Date.now();
+					const domain = extractDomain(item.url!);
+
+					if (!sessionId || timestamp - lastTimestamp > gapMs) {
+						const newId = await db.sessions.add({
+							startTime: timestamp,
+							endTime: timestamp,
+							visitCount: 0,
+						});
+						sessionId = newId as number;
+						sessionMeta.set(sessionId, {
+							visitCount: 0,
+							endTime: timestamp,
+							domainCounts: new Map(),
+						});
+					}
+
+					visits.push({
+						url: item.url!,
+						title: item.title ?? "",
+						domain,
+						timestamp,
+						duration: 0,
+						scrollDepth: 0,
+						sessionId,
+						fromImport: true,
+					});
+
+					const meta = sessionMeta.get(sessionId)!;
+					meta.visitCount++;
+					meta.endTime = timestamp;
+					meta.domainCounts.set(
+						domain,
+						(meta.domainCounts.get(domain) ?? 0) + 1,
+					);
+
+					lastTimestamp = timestamp;
+				}
+
+				await db.visits.bulkAdd(visits);
+
+				// Batch-update session metadata from local tracking (no extra DB reads)
+				const touchedSessionIds = [...new Set(visits.map((v) => v.sessionId))];
+				for (const sid of touchedSessionIds) {
+					const meta = sessionMeta.get(sid);
+					if (!meta) continue;
+					let topDomain = "";
+					let maxCount = 0;
+					for (const [domain, count] of meta.domainCounts) {
+						if (count > maxCount) {
+							topDomain = domain;
+							maxCount = count;
+						}
+					}
+					await db.sessions.update(sid, {
+						visitCount: meta.visitCount,
+						endTime: meta.endTime,
+						topDomain,
+					});
+				}
+
+				await broadcastImportProgress({
+					importing: true,
+					current: Math.min(i + BATCH_SIZE, total),
+					total,
+					done: false,
+				});
+			}
+
+			settings.importCompleted = true;
+			await chrome.storage.sync.set({ settings });
+
+			await broadcastImportProgress({
+				importing: false,
+				current: total,
+				total,
+				done: true,
+			});
+		} catch (err) {
+			await broadcastImportProgress({
+				importing: false,
+				current: 0,
+				total: 0,
+				done: false,
+				error: "Import failed",
+			});
+			console.error("[Better History] Import failed:", err);
+		} finally {
+			importJob = null;
+		}
+	})();
+
+	return importJob;
+};
 
 // Idle detection for session boundaries
 chrome.idle.setDetectionInterval(30 * 60);
@@ -196,14 +394,63 @@ chrome.idle.onStateChanged.addListener((idleState) => {
 
 // Messages from content script — validate sender
 chrome.runtime.onMessage.addListener(
-	(message: VisitMetricsMessage, sender, sendResponse) => {
+	(
+		message:
+			| RegisterPageContextMessage
+			| StartHistoryImportMessage
+			| VisitMetricsMessage,
+		sender,
+		sendResponse,
+	) => {
 		// Only accept messages from our own extension
 		if (sender.id !== chrome.runtime.id) {
 			sendResponse({ ok: false });
 			return;
 		}
 
-		if (message.type === "UPDATE_VISIT_METRICS" && state.pendingVisitId) {
+		if (message.type === "START_HISTORY_IMPORT") {
+			runHistoryImport()
+				.then(() => sendResponse({ ok: true }))
+				.catch(() => sendResponse({ ok: false }));
+			return true;
+		}
+
+		if (
+			(sender.url && sender.url !== message.url) ||
+			typeof message.pageKey !== "string" ||
+			typeof message.url !== "string"
+		) {
+			sendResponse({ ok: false });
+			return;
+		}
+
+		const tabId = sender.tab?.id;
+		if (tabId === undefined) {
+			sendResponse({ ok: false });
+			return;
+		}
+
+		if (message.type === "REGISTER_PAGE_CONTEXT") {
+			const visitId = visitContextRegistry.registerPage(
+				tabId,
+				message.url,
+				message.pageKey,
+			);
+			sendResponse({ ok: visitId !== null });
+			return;
+		}
+
+		const visitId = visitContextRegistry.resolveVisit(
+			tabId,
+			message.url,
+			message.pageKey,
+		);
+		if (!visitId) {
+			sendResponse({ ok: false });
+			return;
+		}
+
+		if (message.type === "UPDATE_VISIT_METRICS") {
 			const updates: Record<string, unknown> = {};
 
 			if (
@@ -223,9 +470,14 @@ chrome.runtime.onMessage.addListener(
 			}
 
 			if (Object.keys(updates).length > 0) {
-				db.visits.update(state.pendingVisitId, updates).then(() => {
-					sendResponse({ ok: true });
-				});
+				db.visits
+					.update(visitId, updates)
+					.then(() => {
+						sendResponse({ ok: true });
+					})
+					.catch(() => {
+						sendResponse({ ok: false });
+					});
 				return true;
 			}
 		}
@@ -237,119 +489,9 @@ chrome.runtime.onMessage.addListener(
 chrome.runtime.onInstalled.addListener(async (details) => {
 	if (details.reason !== "install") return;
 
-	const result = await chrome.storage.sync.get("settings");
-	const settings = result.settings ?? { ...DEFAULT_SETTINGS };
-	if (settings.importCompleted) return;
-
-	try {
-		const startTime = Date.now() - MAX_IMPORT_DAYS * 24 * 60 * 60 * 1000;
-		const items = await chrome.history.search({
-			text: "",
-			startTime,
-			maxResults: 100000,
-		});
-
-		const filtered = [];
-		for (const item of items) {
-			if (item.url && !(await isExcludedUrl(item.url))) {
-				filtered.push(item);
-			}
-		}
-		const sorted = filtered.sort(
-			(a, b) => (a.lastVisitTime ?? 0) - (b.lastVisitTime ?? 0),
-		);
-
-		const total = sorted.length;
-		let sessionId: number | null = null;
-		let lastTimestamp = 0;
-		const gapMs = SESSION_GAP_MS;
-
-		// Track session metadata locally to avoid N+1 DB queries per batch
-		const sessionMeta = new Map<
-			number,
-			{ visitCount: number; endTime: number; domainCounts: Map<string, number> }
-		>();
-
-		const BATCH_SIZE = 500;
-		for (let i = 0; i < sorted.length; i += BATCH_SIZE) {
-			const batch = sorted.slice(i, i + BATCH_SIZE);
-			const visits = [];
-
-			for (const item of batch) {
-				const timestamp = item.lastVisitTime ?? Date.now();
-				const domain = extractDomain(item.url!);
-
-				if (!sessionId || timestamp - lastTimestamp > gapMs) {
-					const newId = await db.sessions.add({
-						startTime: timestamp,
-						endTime: timestamp,
-						visitCount: 0,
-					});
-					sessionId = newId as number;
-					sessionMeta.set(sessionId, {
-						visitCount: 0,
-						endTime: timestamp,
-						domainCounts: new Map(),
-					});
-				}
-
-				visits.push({
-					url: item.url!,
-					title: item.title ?? "",
-					domain,
-					timestamp,
-					duration: 0,
-					scrollDepth: 0,
-					sessionId,
-					fromImport: true,
-				});
-
-				const meta = sessionMeta.get(sessionId)!;
-				meta.visitCount++;
-				meta.endTime = timestamp;
-				meta.domainCounts.set(domain, (meta.domainCounts.get(domain) ?? 0) + 1);
-
-				lastTimestamp = timestamp;
-			}
-
-			await db.visits.bulkAdd(visits);
-
-			// Batch-update session metadata from local tracking (no extra DB reads)
-			const touchedSessionIds = [...new Set(visits.map((v) => v.sessionId))];
-			for (const sid of touchedSessionIds) {
-				const meta = sessionMeta.get(sid);
-				if (!meta) continue;
-				let topDomain = "";
-				let maxCount = 0;
-				for (const [domain, count] of meta.domainCounts) {
-					if (count > maxCount) {
-						topDomain = domain;
-						maxCount = count;
-					}
-				}
-				await db.sessions.update(sid, {
-					visitCount: meta.visitCount,
-					endTime: meta.endTime,
-					topDomain,
-				});
-			}
-
-			// Broadcast progress
-			chrome.runtime
-				.sendMessage({
-					type: "IMPORT_PROGRESS",
-					current: Math.min(i + BATCH_SIZE, total),
-					total,
-					done: i + BATCH_SIZE >= total,
-				})
-				.catch(() => {});
-		}
-
-		settings.importCompleted = true;
-		await chrome.storage.sync.set({ settings });
-	} catch (err) {
+	runHistoryImport().catch((err) => {
 		console.error("[Better History] Import failed:", err);
-	}
+	});
 });
 
 // Auto-prune old text content based on settings
@@ -391,6 +533,20 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // Restore state on service worker wake-up
 restoreState();
+chrome.storage.session
+	.get(IMPORT_STATE_STORAGE_KEY)
+	.then((result) => {
+		if (!result[IMPORT_STATE_STORAGE_KEY]) {
+			return broadcastImportProgress({
+				importing: false,
+				current: 0,
+				total: 0,
+				done: false,
+			});
+		}
+		return undefined;
+	})
+	.catch(() => {});
 runAutoPrune();
 
 console.log("[Better History] Background service worker loaded");

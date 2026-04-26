@@ -4,15 +4,18 @@ import { db } from "../../shared/db";
 import { formatDuration } from "../../shared/utils";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { useToast } from "../components/Toast";
+import { useImportHistory } from "../hooks/useImportHistory";
 import { useSettings } from "../hooks/useSettings";
 
 export const SettingsView = () => {
 	const { settings, updateSettings, loaded } = useSettings();
 	const { toast } = useToast();
+	const importState = useImportHistory();
 	const [newDomain, setNewDomain] = useState("");
 	const [clearing, setClearing] = useState(false);
 	const [exporting, setExporting] = useState(false);
 	const [showClearConfirm, setShowClearConfirm] = useState(false);
+	const version = chrome.runtime.getManifest().version;
 
 	const stats = useLiveQuery(async () => {
 		const visitCount = await db.visits.count();
@@ -68,7 +71,25 @@ export const SettingsView = () => {
 		updateSettings({ importCompleted: false });
 		setClearing(false);
 		setShowClearConfirm(false);
-		toast("All data cleared", "info");
+		toast(
+			"All data cleared. You can restore the last 90 days anytime.",
+			"info",
+		);
+	};
+
+	const handleRestoreHistory = async () => {
+		try {
+			const response = await chrome.runtime.sendMessage({
+				type: "START_HISTORY_IMPORT",
+			});
+			if (response?.ok) {
+				toast("Import started", "info");
+				return;
+			}
+		} catch {
+			// handled below
+		}
+		toast("Could not start the history import.", "error");
 	};
 
 	return (
@@ -196,6 +217,42 @@ export const SettingsView = () => {
 
 			{/* Data Management */}
 			<SettingsSection title="Data">
+				{stats?.visitCount === 0 && (
+					<div className="mb-4 rounded-lg border border-honey-200 dark:border-honey-800/40 bg-honey-50/70 dark:bg-honey-900/10 px-4 py-3">
+						<p className="text-[12px] text-honey-800 dark:text-honey-300 font-medium">
+							Restore the last {90} days from Chrome history
+						</p>
+						<p className="mt-1 text-[11px] text-honey-700 dark:text-honey-400 leading-relaxed">
+							This rebuilds your local Better History index from the browser
+							history already on this device.
+						</p>
+						{importState.importing && !importState.done ? (
+							<div className="mt-3">
+								<div className="h-1 rounded-full overflow-hidden bg-honey-100 dark:bg-honey-900/30">
+									<div
+										className="h-full rounded-full bg-honey-400 transition-all duration-500 ease-out"
+										style={{
+											width: `${importState.total > 0 ? (importState.current / importState.total) * 100 : 0}%`,
+										}}
+									/>
+								</div>
+								<p className="mt-2 text-[11px] text-honey-700 dark:text-honey-400 tabular-nums">
+									{importState.current.toLocaleString()} of{" "}
+									{importState.total.toLocaleString()} pages
+								</p>
+							</div>
+						) : (
+							<button
+								type="button"
+								onClick={handleRestoreHistory}
+								className="mt-3 inline-flex items-center rounded-lg bg-honey-500 px-3 py-2 text-[12px] font-medium text-white transition-colors hover:bg-honey-600 disabled:opacity-50"
+							>
+								Restore History
+							</button>
+						)}
+					</div>
+				)}
+
 				{stats && (
 					<div className="grid grid-cols-3 gap-3 mb-4">
 						<DataStat
@@ -229,10 +286,27 @@ export const SettingsView = () => {
 				</div>
 			</SettingsSection>
 
+			<SettingsSection
+				title="Privacy"
+				description="Better History exists to organize and search your browsing history. All indexed data stays on-device."
+			>
+				<div className="space-y-2 text-[12px] text-sand-500 dark:text-sand-400 leading-relaxed">
+					<p>
+						Page titles, URLs, timestamps, scroll depth, and extracted text are
+						stored locally in your browser for search, timeline grouping, and
+						analytics.
+					</p>
+					<p>
+						No browsing data is sent to external servers, sold, or used for ads.
+						You can export or delete everything from the Data section above.
+					</p>
+				</div>
+			</SettingsSection>
+
 			{/* Footer */}
 			<div className="pt-4 border-t border-sand-200 dark:border-sand-800">
 				<div className="flex items-center justify-between text-[11px] text-sand-400">
-					<span className="font-serif italic">Better History v0.1.0</span>
+					<span className="font-serif italic">Better History v{version}</span>
 					<span>All data stored locally</span>
 				</div>
 			</div>
